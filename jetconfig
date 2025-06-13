@@ -1,0 +1,239 @@
+#!/bin/bash
+#
+# jetconfig - NVIDIA Jetson Orin Nano SSD + Docker configuration CLI tool
+# Copyright (c) 2025 Joshua Andreas Wellbrock
+# Licensed under the MIT License (see LICENSE file in repository root)
+#
+set -e
+
+# Default values
+DEVICE=""
+MOUNTING_POINT="/ssd"
+MEMORY_OPTIMIZATION="false"
+
+# Help message
+help() {
+    echo "Usage: jetconfig [options]"
+    echo "Options:"
+    echo "  -d, --device <device>           Specify the device memory device (e.g., /dev/nvme0n1) - run lsblk to find available devices"
+    echo "  -mp, --mounting-point <path>    Specify the mounting point (default: /ssd)"
+    echo "  -m, --memory-optimization       Enable memory optimization (this will disable GUI, disable misc services and mount swap, disable ZRAM)"
+    echo "  -h, --help                      Show this help message"
+}
+
+# Parse command line arguments
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -d|--device)
+            DEVICE="$2"
+            shift 2
+            ;;
+        -mp|--mounting-point)
+            MOUNTING_POINT="$2"
+            shift 2
+            ;;
+        -m|--memory-optimization)
+            MEMORY_OPTIMIZATION="true"
+            shift
+            ;;
+        -h|--help)
+            help
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            help
+            exit 1
+            ;;
+    esac
+done
+
+# Validate input
+if [[ -z "$DEVICE" ]]; then
+  echo "❌ Error: --device argument is required."
+  help
+fi
+
+echo "📦 Starting Jetson Orin Nano configuration..."
+echo "📁 Mounting SSD from $DEVICE..."
+
+echo "⚠️ WARNING: This will FORMAT and ERASE ALL DATA on the device '$DEVICE'."
+read -r -p "Are you sure you want to proceed? (yes/no): " confirm_format
+
+if [[ ! "$confirm_format" =~ ^(yes|y|Yes|YES)$ ]]; then
+    echo "Aborting operation. No changes made to $DEVICE."
+    exit 0 # Exit gracefully if the user does not confirm
+fi
+
+sudo mkfs.ext4 "$DEVICE"
+sudo mkdir -p "$MOUNTING_POINT"
+sudo mount "$DEVICE" "$MOUNTING_POINT"
+echo "✅ Mounted $DEVICE at $MOUNTING_POINT."
+
+echo "🔧 Configuring fstab for automatic mounting ..."
+UUID=$(lsblk -no UUID "$DEVICE")
+
+# Validate UUID
+if [[ -z "$UUID" ]]; then
+  echo "❌ Could not find UUID for $DEVICE"
+  exit 1
+fi
+
+echo "📦 UUID for $DEVICE is $UUID"
+
+# Add to /etc/fstab if not already present
+if ! grep -q "$UUID" /etc/fstab; then
+  echo "📄 Adding entry to /etc/fstab..."
+  echo "UUID=$UUID $MOUNTING_POINT ext4 defaults 0 2" | sudo tee -a /etc/fstab
+else
+  echo "⚠️ Entry for UUID already exists in /etc/fstab. Skipping."
+fi
+
+# Change ownership of the mounting point
+echo "🔒 Changing ownership of $MOUNTING_POINT to $USER..."
+sudo chown "$USER":"$USER" "$MOUNTING_POINT"
+echo "✅ Ownership changed."
+
+# Install nvidia-container if not already installed
+if ! dpkg -l | grep -q nvidia-container; then
+  echo "📦 Installing nvidia-container..."
+  sudo apt update
+  sudo apt install -y nvidia-container
+else
+  echo "✅ nvidia-container is already installed."
+fi
+
+# Restart docker
+echo "🔧 Docker configuration..."
+sudo systemctl restart docker
+sudo usermod -aG docker "$USER"
+newgrp docker
+
+# Add default container runtime in daemon.json
+sudo apt install -y jq
+sudo jq '. + {"default-runtime": "nvidia"}' /etc/docker/daemon.json | \
+  sudo tee /etc/docker/daemon.json.tmp && \
+  sudo mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+
+# Restart docker to apply changes
+sudo systemctl daemon-reload && sudo systemctl restart docker
+
+# Migrate docker directory to SSD
+echo "📦 Stopping docker service..."
+sudo systemctl stop docker
+echo "📁 Migrating Docker directory to $MOUNTING_POINT/docker..."
+sudo du -csh /var/lib/docker/ && \
+    sudo mkdir "$MOUNTING_POINT/docker" && \
+    sudo rsync -axPS /var/lib/docker/ "$MOUNTING_POINT/docker/" && \
+    sudo du -csh  "$MOUNTING_POINT/docker/"
+
+# Edit /etc/docker/daemon.json
+echo "🔧 Configuring Docker to use SSD..."
+if [[ ! -f /etc/docker/daemon.json ]]; then
+  echo '{}' | sudo tee /etc/docker/daemon.json > /dev/null
+fi
+
+sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
+
+sudo jq ". + {\"data-root\": \"${MOUNTING_POINT}/docker\"}" /etc/docker/daemon.json | \
+  sudo tee /etc/docker/daemon.json.tmp > /dev/null && \
+  sudo mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+
+# Rename old docker directory
+sudo mv /var/lib/docker /var/lib/docker.old
+
+echo "🔄 Restarting docker service..."
+sudo systemctl daemon-reload && \
+    sudo systemctl restart docker && \
+    sudo journalctl -u docker | tail -n 50
+
+echo "✅ Docker configuration completed."
+
+
+echo "🔍 Verifying Docker configuration..."
+
+EXPECTED_DOCKER_DIR="${MOUNTING_POINT}/docker"
+
+# 1. Check if NVMe device exists and has UUID
+if ! sudo blkid | grep -q "$DEVICE"; then
+  echo "❌ NVMe device $DEVICE not found or not formatted."
+  exit 1
+else
+  UUID=$(sudo blkid | grep "$DEVICE" | grep -o 'UUID="[^"]*"' | cut -d'"' -f2)
+  echo "✅ NVMe device found with UUID: $UUID"
+fi
+
+# 2. Check if mounted at $MOUNTING_POINT
+if ! mount | grep -q "$MOUNTING_POINT"; then
+  echo "❌ $MOUNTING_POINT not mounted. Current mounts:"
+  df -h | grep "$DEVICE"
+  exit 1
+else
+  echo "✅ $DEVICE is mounted at $MOUNTING_POINT"
+fi
+
+# 3. Check fstab entry
+if ! grep -q "$UUID" /etc/fstab; then
+  echo "❌ UUID not found in /etc/fstab"
+  exit 1
+else
+  echo "✅ UUID correctly added to /etc/fstab"
+fi
+
+# 4. Check Docker Root Dir
+DOCKER_ROOT=$(docker info 2>/dev/null | grep "Docker Root Dir" | awk -F': ' '{print $2}')
+if [[ "$DOCKER_ROOT" == "$EXPECTED_DOCKER_DIR" ]]; then
+  echo "✅ Docker Root Dir is correctly set to $EXPECTED_DOCKER_DIR"
+else
+  echo "❌ Docker Root Dir is $DOCKER_ROOT, expected $EXPECTED_DOCKER_DIR"
+  exit 1
+fi
+
+# 5. Check NVIDIA runtime is default
+if docker info 2>/dev/null | grep -q 'Default Runtime: nvidia'; then
+  echo "✅ NVIDIA is set as default runtime"
+else
+  echo "❌ NVIDIA is not the default runtime"
+  exit 1
+fi
+
+# 6. Check Docker is actually writing to SSD
+if sudo du -sh "${EXPECTED_DOCKER_DIR}" | grep -q '[0-9]'; then
+  echo "✅ Docker is using SSD storage"
+else
+  echo "❌ No Docker data found at ${EXPECTED_DOCKER_DIR}"
+  exit 1
+fi
+
+echo "🎉 All checks passed. SSD and Docker configuration done."
+
+# Memory optimization (if enabled)
+if [[ "$MEMORY_OPTIMIZATION" == "true" ]]; then
+    echo "🔧 Enabling memory optimization..."
+    
+    # Disable GUI
+    echo "Disabling GUI..."
+    sudo systemctl set-default multi-user.target
+
+    # Disable misc services
+    echo "Disabling misc services..."
+    sudo systemctl disable nvargus-daemon.service
+
+    # Mount swap
+    echo "Mounting swap..."
+    sudo systemctl disable nvzramconfig
+    sudo fallocate -l 16G "$MOUNTING_POINT"/16GB.swap
+    sudo mkswap "$MOUNTING_POINT"/16GB.swap
+    sudo swapon "$MOUNTING_POINT"/16GB.swap
+    grep -qxF "$MOUNTING_POINT/16GB.swap none swap sw 0 0" /etc/fstab || \
+    echo "$MOUNTING_POINT/16GB.swap none swap sw 0 0" | sudo tee -a /etc/fstab
+    # Fix insecure permissions
+    sudo chmod 0600 "$MOUNTING_POINT"/16GB.swap
+
+
+    echo "✅ Memory optimization enabled."
+else
+    echo "⚠️ Memory optimization not enabled."
+fi
+
+echo "🚀 Jetson Orin Nano configuration completed successfully!"
