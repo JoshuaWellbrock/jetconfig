@@ -2,6 +2,8 @@
 
 JetConfig is a command-line interface (CLI) tool designed to streamline the configuration of an SSD on your NVIDIA Jetson Orin Nano Developer Kit. It also optimizes Docker to use the SSD and provides memory optimization options for a lean system.
 
+All steps are according to the official [Jetson Setup Guide](https://www.jetson-ai-lab.com/initial_setup_jon.html).
+
 ## Features:
 - Formats and mounts an SSD
 - Configures `fstab` automatic SSD mounting
